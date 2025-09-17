@@ -8,6 +8,10 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 import google.generativeai as genai
+try:
+    from google.generativeai import types as genai_types
+except Exception:
+    genai_types = None
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, ListFlowable, ListItem
@@ -27,6 +31,7 @@ st.set_page_config(page_title="ResumeFix AI", page_icon="🧠", layout="wide")
 
 APP_TITLE = "ResumeFix AI"
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CSV_MODEL_NAME = "models/gemini-2.5-flash-lite"
 BUILDER_STEPS = [
     "Personal Detail",
     "Summary",
@@ -66,6 +71,21 @@ def _get_model() -> Optional[object]:
     return st.session_state.get("gemini_model")
 
 
+def _get_csv_model() -> Optional[object]:
+    # Ensure base init happened to configure API key
+    if not st.session_state.get("gemini_initialized"):
+        _init_gemini_once()
+    if st.session_state.get("gemini_error"):
+        return None
+    if "gemini_model_csv" not in st.session_state:
+        try:
+            st.session_state["gemini_model_csv"] = genai.GenerativeModel(CSV_MODEL_NAME)
+        except Exception as ex:
+            st.session_state["gemini_error"] = f"Failed to initialize CSV model: {ex}"
+            return None
+    return st.session_state.get("gemini_model_csv")
+
+
 def _generate_text(prompt: str) -> str:
     model = _get_model()
     if model is None:
@@ -94,6 +114,50 @@ def build_chatbot_prompt(resume_text: str) -> str:
         "Keep it under 150 words. Be direct. No fluff.\n\n"
         f"RESUME: {truncated}"
     )
+
+
+# Fast, low-token generator for CSV extraction using the lite model with thinking disabled
+def _generate_csv_text(prompt: str, max_tokens: int = 96) -> str:
+    model = _get_csv_model()
+    if model is None:
+        return ""
+    # Try to disable thinking explicitly when supported, and cap tokens
+    if genai_types is not None:
+        try:
+            gen_cfg = None
+            try:
+                gen_cfg = genai_types.GenerationConfig(max_output_tokens=max_tokens, temperature=0.0)
+            except Exception:
+                gen_cfg = None
+            cfg = genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                generation_config=gen_cfg,
+            )
+            response = model.generate_content(prompt, config=cfg)
+            if hasattr(response, "text") and isinstance(response.text, str):
+                return response.text.strip()
+            return str(response)
+        except Exception:
+            pass
+    # Fallback for older SDKs without types or config support
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": max_tokens, "temperature": 0.0},
+        )
+        if hasattr(response, "text") and isinstance(response.text, str):
+            return response.text.strip()
+        return str(response)
+    except Exception as ex:
+        st.error(f"Gemini CSV API error: {ex}")
+        return ""
+
+
+def _extract_row_from_text(text: str) -> Dict[str, str]:
+    prompt = build_extractor_prompt(text)
+    ai_line = _generate_csv_text(prompt, max_tokens=96)
+    parsed = parse_gemini_csv_line(ai_line)
+    return parsed
 
 
 def build_extractor_prompt(resume_text: str) -> str:
@@ -179,6 +243,8 @@ def render_bulk_extractor() -> None:
         key="multi_pdf",
     )
 
+    concurrency = st.slider("Parallel requests", 1, 8, 4, help="Increase gradually if your quota allows")
+
     if st.button("🚀 Extract → CSV"):
         if not uploaded_files:
             st.warning("Please upload at least one PDF resume.")
@@ -188,24 +254,54 @@ def render_bulk_extractor() -> None:
             st.error(st.session_state["gemini_error"])
             return
 
-        rows: List[Dict[str, str]] = []
-        with st.spinner("Extracting data from resumes..."):
-            for uf in uploaded_files:
-                text = extract_text(uf)
-                if not text.strip():
-                    rows.append({
-                        "Name": "Not found",
-                        "Email": "Not found",
-                        "Skills": "Not found",
-                        "Role": "Not found",
-                        "Experience": "Not found",
-                    })
-                    continue
+        # Pre-extract text (safer with UploadedFile handles)
+        texts: List[str] = []
+        for uf in uploaded_files:
+            texts.append(extract_text(uf))
 
-                prompt = build_extractor_prompt(text)
-                ai_line = _generate_text(prompt)
-                parsed = parse_gemini_csv_line(ai_line)
-                rows.append(parsed)
+        # Prepare result slots
+        rows: List[Optional[Dict[str, str]]] = []
+        for t in texts:
+            if not (t or "").strip():
+                rows.append({
+                    "Name": "Not found",
+                    "Email": "Not found",
+                    "Skills": "Not found",
+                    "Role": "Not found",
+                    "Experience": "Not found",
+                })
+            else:
+                rows.append(None)
+
+        num_tasks = sum(1 for r in rows if r is None)
+        progress = st.progress(0.0)
+        completed = 0
+
+        if num_tasks > 0:
+            with st.spinner("Extracting data from resumes..."):
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                max_workers = min(concurrency, num_tasks)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    fut_to_idx = {}
+                    for idx, t in enumerate(texts):
+                        if rows[idx] is None:
+                            fut_to_idx[ex.submit(_extract_row_from_text, t)] = idx
+
+                    for fut in as_completed(fut_to_idx):
+                        idx = fut_to_idx[fut]
+                        try:
+                            rows[idx] = fut.result()
+                        except Exception:
+                            rows[idx] = {
+                                "Name": "Not found",
+                                "Email": "Not found",
+                                "Skills": "Not found",
+                                "Role": "Not found",
+                                "Experience": "Not found",
+                            }
+                        finally:
+                            completed += 1
+                            progress.progress(completed / max(1, num_tasks))
 
         df = pd.DataFrame(rows, columns=["Name", "Email", "Skills", "Role", "Experience"])
         st.subheader("Preview")
